@@ -85,7 +85,8 @@ namespace CosmosDbMigration
                     },
                     ConnectionMode = ConnectionMode.Direct,
                     MaxRetryAttemptsOnRateLimitedRequests = 9,
-                    MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(30)
+                    MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(30),
+                    AllowBulkExecution = true
                 };
 
                 using var sourceClient = new CosmosClient(sourceConnectionString, clientOptions);
