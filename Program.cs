@@ -391,8 +391,11 @@ namespace CosmosDbMigration
                 var errors = new List<string>();
                 double totalRU = 0;
 
+                var semaphore = new SemaphoreSlim(20);
+
                 Func<dynamic, PartitionKey, Task<string?>> upsertAsync = async (doc, pk) =>
                 {
+                    await semaphore.WaitAsync();
                     try
                     {
                         await destinationContainer.UpsertItemAsync<dynamic>(doc, pk);
@@ -401,6 +404,10 @@ namespace CosmosDbMigration
                     catch (Exception ex)
                     {
                         return ex.Message;
+                    }
+                    finally
+                    {
+                        semaphore.Release();
                     }
                 };
 
