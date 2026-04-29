@@ -391,100 +391,98 @@ namespace CosmosDbMigration
                 var errors = new List<string>();
                 double totalRU = 0;
 
+                Func<dynamic, PartitionKey, Task<string?>> upsertAsync = async (doc, pk) =>
+                {
+                    try
+                    {
+                        await destinationContainer.UpsertItemAsync<dynamic>(doc, pk);
+                        return null;
+                    }
+                    catch (Exception ex)
+                    {
+                        return ex.Message;
+                    }
+                };
+
                 while (queryIterator.HasMoreResults)
                 {
                     var response = await queryIterator.ReadNextAsync();
                     totalRU += response.RequestCharge;
 
+                    var pageTasks = new List<Task<string?>>();
+
                     foreach (var document in response)
                     {
                         processedCount++;
 
-                        try
+                        bool hasAllKeys = true;
+                        var partitionKeyBuilder = new PartitionKeyBuilder();
+
+                        foreach (var pkPath in destinationPartitionKeyPaths)
                         {
-                            // Verifica campi obbligatori basati sulle partition keys
-                            bool hasAllKeys = true;
-                            var partitionKeyBuilder = new PartitionKeyBuilder();
+                            var value = GetPropertyValue(document, pkPath);
 
-                            foreach (var pkPath in destinationPartitionKeyPaths)
+                            if (value == null)
                             {
-                                var value = GetPropertyValue(document, pkPath);
+                                var dict = (IDictionary<string, object>)document;
+                                var availableKeys = string.Join(", ", dict.Keys.Take(10));
+                                Console.WriteLine($"   🔍 DEBUG: Looking for '{pkPath}', available keys: {availableKeys}");
 
-                                if (value == null)
-                                {
-                                    // DEBUG: Mostra quali chiavi sono presenti nel documento
-                                    var dict = (IDictionary<string, object>)document;
-                                    var availableKeys = string.Join(", ", dict.Keys.Take(10));
+                                if (_settings.MigrationSettings.ShowDetailedErrors)
+                                    Console.WriteLine($"   ⚠️  Skipped: Document without '{pkPath}' (id: {document.id ?? "unknown"})");
 
-                                    Console.WriteLine($"   🔍 DEBUG: Looking for '{pkPath}', available keys: {availableKeys}");
-
-                                    if (_settings.MigrationSettings.ShowDetailedErrors)
-                                    {
-                                        Console.WriteLine($"   ⚠️  Skipped: Document without '{pkPath}' (id: {document.id ?? "unknown"})");
-                                    }
-                                    hasAllKeys = false;
-                                    break;
-                                }
-
-                                partitionKeyBuilder.Add(value.ToString());
+                                hasAllKeys = false;
+                                break;
                             }
 
-                            if (!hasAllKeys)
-                            {
-                                skippedCount++;
-                                continue;
-                            }
+                            partitionKeyBuilder.Add(value.ToString());
+                        }
 
-                            if (!_settings.MigrationSettings.DryRun)
-                            {
-                                // Crea la partition key
-                                var partitionKey = partitionKeyBuilder.Build();
+                        if (!hasAllKeys)
+                        {
+                            skippedCount++;
+                            continue;
+                        }
 
-                                // Inserisci il documento
-                                await destinationContainer.UpsertItemAsync(
-                                    document,
-                                    partitionKey
-                                );
-                            }
-
+                        if (_settings.MigrationSettings.DryRun)
+                        {
                             successCount++;
-
-                            // Progress report
-                            if (processedCount % _settings.MigrationSettings.BatchSize == 0)
-                            {
-                                var percentage = (double)processedCount / sourceDocumentCount * 100;
-                                var avgSpeed = processedCount / stopwatch.Elapsed.TotalSeconds;
-                                var eta = avgSpeed > 0 ? TimeSpan.FromSeconds((sourceDocumentCount - processedCount) / avgSpeed) : TimeSpan.Zero;
-
-                                Console.WriteLine($"   📈 Progress: {processedCount:N0}/{sourceDocumentCount:N0} ({percentage:F1}%) - " +
-                                                $"Success: {successCount:N0}, Skipped: {skippedCount}, Errors: {errorCount} - " +
-                                                $"Speed: {avgSpeed:F0} docs/s - ETA: {eta:hh\\:mm\\:ss}");
-                            }
+                            continue;
                         }
-                        catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Conflict)
-                        {
-                            // Documento già esiste
-                            successCount++; // Conta come successo se già presente
-                        }
-                        catch (Exception ex)
-                        {
-                            errorCount++;
-                            var errorMsg = $"Document {document.id ?? "unknown"}: {ex.Message}";
-                            errors.Add(errorMsg);
 
-                            if (_settings.MigrationSettings.ShowDetailedErrors &&
-                                errorCount <= _settings.MigrationSettings.MaxErrorsToDisplay)
-                            {
-                                Console.WriteLine($"   ❌ Error: {errorMsg}");
-                            }
-                        }
+                        var partitionKey = partitionKeyBuilder.Build();
+                        pageTasks.Add(upsertAsync(document, partitionKey));
                     }
 
-                    // Mostra RU consumed ogni batch
-                    if (processedCount % (_settings.MigrationSettings.BatchSize * 5) == 0)
+                    if (pageTasks.Count > 0)
                     {
-                        Console.WriteLine($"   💰 Total RU consumed so far: {totalRU:F2}");
+                        var results = await Task.WhenAll(pageTasks);
+                        foreach (var error in results)
+                        {
+                            if (error == null)
+                            {
+                                successCount++;
+                            }
+                            else
+                            {
+                                errorCount++;
+                                errors.Add(error);
+                                if (_settings.MigrationSettings.ShowDetailedErrors &&
+                                    errorCount <= _settings.MigrationSettings.MaxErrorsToDisplay)
+                                {
+                                    Console.WriteLine($"   ❌ Error: {error}");
+                                }
+                            }
+                        }
                     }
+
+                    var percentage = (double)processedCount / sourceDocumentCount * 100;
+                    var avgSpeed = processedCount / stopwatch.Elapsed.TotalSeconds;
+                    var eta = avgSpeed > 0 ? TimeSpan.FromSeconds((sourceDocumentCount - processedCount) / avgSpeed) : TimeSpan.Zero;
+                    Console.WriteLine($"   📈 Progress: {processedCount:N0}/{sourceDocumentCount:N0} ({percentage:F1}%) - " +
+                                    $"Success: {successCount:N0}, Skipped: {skippedCount}, Errors: {errorCount} - " +
+                                    $"Speed: {avgSpeed:F0} docs/s - ETA: {eta:hh\\:mm\\:ss}");
+                    Console.WriteLine($"   💰 Total RU consumed so far: {totalRU:F2}");
                 }
 
                 stopwatch.Stop();
