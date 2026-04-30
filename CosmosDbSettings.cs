@@ -18,6 +18,7 @@ namespace CosmosDbMigration.Configuration
         public bool DryRun { get; set; } = false;
         public bool ShowDetailedErrors { get; set; } = true;
         public int MaxErrorsToDisplay { get; set; } = 10;
+        public double MaxRuPerSecond { get; set; } = 1000.0;
     }
 
     public class AppSettings
