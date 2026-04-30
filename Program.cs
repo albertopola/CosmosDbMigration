@@ -46,6 +46,7 @@ namespace CosmosDbMigration
                 }
 
                 Console.WriteLine($"   Batch size: {_settings.MigrationSettings.BatchSize}");
+                Console.WriteLine($"   Max RU/s:   {_settings.MigrationSettings.MaxRuPerSecond:N0}");
                 Console.WriteLine($"   Dry run: {(_settings.MigrationSettings.DryRun ? "YES" : "NO")}\n");
             }
             catch (Exception ex)
@@ -392,18 +393,22 @@ namespace CosmosDbMigration
                 double totalRU = 0;
 
                 var semaphore = new SemaphoreSlim(10);
+                var ruLimiter = new RuRateLimiter(_settings.MigrationSettings.MaxRuPerSecond);
 
-                Func<dynamic, PartitionKey, Task<string?>> upsertAsync = async (doc, pk) =>
+                Func<dynamic, PartitionKey, Task<(string? error, double ru)>> upsertAsync = async (doc, pk) =>
                 {
+                    await ruLimiter.WaitAsync();
                     await semaphore.WaitAsync();
                     try
                     {
-                        await destinationContainer.UpsertItemAsync<dynamic>(doc, pk);
-                        return null;
+                        var resp = await destinationContainer.UpsertItemAsync<dynamic>(doc, pk);
+                        await ruLimiter.RecordAsync(resp.RequestCharge);
+                        return (null, resp.RequestCharge);
                     }
                     catch (Exception ex)
                     {
-                        return ex.Message;
+                        await ruLimiter.RecordAsync(0);
+                        return (ex.Message, 0);
                     }
                     finally
                     {
@@ -416,7 +421,7 @@ namespace CosmosDbMigration
                     var response = await queryIterator.ReadNextAsync();
                     totalRU += response.RequestCharge;
 
-                    var pageTasks = new List<Task<string?>>();
+                    var pageTasks = new List<Task<(string? error, double ru)>>();
 
                     foreach (var document in response)
                     {
@@ -464,20 +469,21 @@ namespace CosmosDbMigration
                     if (pageTasks.Count > 0)
                     {
                         var results = await Task.WhenAll(pageTasks);
-                        foreach (var error in results)
+                        foreach (var result in results)
                         {
-                            if (error == null)
+                            if (result.error == null)
                             {
                                 successCount++;
+                                totalRU += result.ru;
                             }
                             else
                             {
                                 errorCount++;
-                                errors.Add(error);
+                                errors.Add(result.error);
                                 if (_settings.MigrationSettings.ShowDetailedErrors &&
                                     errorCount <= _settings.MigrationSettings.MaxErrorsToDisplay)
                                 {
-                                    Console.WriteLine($"   ❌ Error: {error}");
+                                    Console.WriteLine($"   ❌ Error: {result.error}");
                                 }
                             }
                         }
@@ -486,10 +492,11 @@ namespace CosmosDbMigration
                     var percentage = (double)processedCount / sourceDocumentCount * 100;
                     var avgSpeed = processedCount / stopwatch.Elapsed.TotalSeconds;
                     var eta = avgSpeed > 0 ? TimeSpan.FromSeconds((sourceDocumentCount - processedCount) / avgSpeed) : TimeSpan.Zero;
+                    var currentRuPerSec = ruLimiter.GetCurrentRuPerSecond();
                     Console.WriteLine($"   📈 Progress: {processedCount:N0}/{sourceDocumentCount:N0} ({percentage:F1}%) - " +
                                     $"Success: {successCount:N0}, Skipped: {skippedCount}, Errors: {errorCount} - " +
                                     $"Speed: {avgSpeed:F0} docs/s - ETA: {eta:hh\\:mm\\:ss}");
-                    Console.WriteLine($"   💰 Total RU consumed so far: {totalRU:F2}");
+                    Console.WriteLine($"   💰 RU/s now: {currentRuPerSec:F0}/{_settings.MigrationSettings.MaxRuPerSecond:N0} — Total: {totalRU:F0}");
                 }
 
                 stopwatch.Stop();
@@ -743,6 +750,89 @@ namespace CosmosDbMigration
             {
                 return null;
             }
+        }
+    }
+
+    // Sliding-window RU/s rate limiter.
+    // Uses an exponential moving average of actual RU costs to pre-reserve budget
+    // before each write, so the throttle adapts automatically to document size.
+    internal sealed class RuRateLimiter
+    {
+        private readonly double _maxRuPerSecond;
+        private readonly Queue<(DateTime at, double ru)> _window = new();
+        private double _windowTotal;
+        private double _inflightRu;
+        private double _avgRuPerWrite = 10.0;
+        private readonly SemaphoreSlim _gate = new(1, 1);
+
+        public RuRateLimiter(double maxRuPerSecond) => _maxRuPerSecond = maxRuPerSecond;
+
+        // Waits until there is RU budget, then pre-reserves an estimated slot.
+        public async Task WaitAsync()
+        {
+            while (true)
+            {
+                TimeSpan waitTime;
+                await _gate.WaitAsync();
+                try
+                {
+                    Purge();
+                    if (_windowTotal + _inflightRu + _avgRuPerWrite <= _maxRuPerSecond)
+                    {
+                        _inflightRu += _avgRuPerWrite;
+                        return;
+                    }
+                    waitTime = _window.TryPeek(out var oldest)
+                        ? oldest.at.AddSeconds(1) - DateTime.UtcNow
+                        : TimeSpan.FromMilliseconds(50);
+                    if (waitTime <= TimeSpan.Zero) waitTime = TimeSpan.FromMilliseconds(10);
+                }
+                finally
+                {
+                    _gate.Release();
+                }
+                await Task.Delay(waitTime);
+            }
+        }
+
+        // Records the actual RU cost after a write (or 0 on error to release the reservation).
+        public async Task RecordAsync(double actualRu)
+        {
+            await _gate.WaitAsync();
+            try
+            {
+                _inflightRu = Math.Max(0, _inflightRu - _avgRuPerWrite);
+                if (actualRu > 0)
+                {
+                    // Exponential moving average: reacts faster to size changes
+                    _avgRuPerWrite = _avgRuPerWrite * 0.85 + actualRu * 0.15;
+                    _window.Enqueue((DateTime.UtcNow, actualRu));
+                    _windowTotal += actualRu;
+                }
+            }
+            finally
+            {
+                _gate.Release();
+            }
+        }
+
+        // Returns the RU consumed in the last second (including in-flight estimates).
+        public double GetCurrentRuPerSecond()
+        {
+            _gate.Wait();
+            try { Purge(); return _windowTotal + _inflightRu; }
+            finally { _gate.Release(); }
+        }
+
+        private void Purge()
+        {
+            var cutoff = DateTime.UtcNow.AddSeconds(-1);
+            while (_window.TryPeek(out var e) && e.at < cutoff)
+            {
+                _window.Dequeue();
+                _windowTotal -= e.ru;
+            }
+            if (_windowTotal < 0) _windowTotal = 0;
         }
     }
 }
